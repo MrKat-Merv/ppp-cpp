@@ -1,0 +1,517 @@
+#!/usr/bin/env bash
+# ppp — tiny workflow helper for my "Programming: Principles and Practice
+# Using C++ (3rd ed.)" study repo.
+#
+#   ./ppp setup [repo-name] [--private]   one-time: tidy repo + create it on GitHub + push
+#   ./ppp new <ch> <drill|ex|notes> [n] [name]   start a new drill/exercise/notes file
+#   ./ppp run <file.cpp|dir> [-- args...]  compile (with `import std;`) and run
+#   ./ppp save ["message"]                regenerate README, commit everything, push
+#   ./ppp done <ch>                       mark a chapter finished (toggles)
+#   ./ppp journal "what I learned"        add a dated line to JOURNAL.md
+#   ./ppp readme                          regenerate the README progress section
+#   ./ppp std                             (re)build build/std.pcm + build/std.o
+#   ./ppp fmt [files...]                  clang-format (all chapter code by default)
+#
+# Works with the bash 3.2 that ships on macOS.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# ---------------------------------------------------------------- config ----
+CXX="${CXX:-clang++}"
+STD_FLAGS="-std=c++23 -stdlib=libc++"
+WARN_FLAGS="-Wall -Wextra -Wpedantic -Wconversion -Wshadow -g"
+EXTRA_LDFLAGS=""
+STD_PCM="build/std.pcm"
+STD_OBJ="build/std.o"
+STD_CPPM="${STD_CPPM:-}"
+REPO_DESCRIPTION="My solutions, notes and projects while working through Programming: Principles and Practice Using C++ (3rd ed.) by Bjarne Stroustrup"
+# Machine-specific overrides live in .ppprc (git-ignored). See .ppprc.example.
+[ -f "$ROOT/.ppprc" ] && . "$ROOT/.ppprc"
+
+# PPP3 chapter titles (index = chapter number). 22–27 are PPP2 chapters that
+# the 3rd edition dropped; Stroustrup refers readers to them as "PPP2.ChNN".
+TITLES=(
+  "Notes to the Reader"
+  "Hello, World!"
+  "Objects, Types, and Values"
+  "Computation"
+  "Errors!"
+  "Writing a Program"
+  "Completing a Program"
+  "Technicalities: Functions, etc."
+  "Technicalities: Classes, etc."
+  "Input and Output Streams"
+  "A Display Model"
+  "Graphics Classes"
+  "Class Design"
+  "Graphing Functions and Data"
+  "Graphical User Interfaces"
+  "Vector and Free Store"
+  "Arrays, Pointers, and References"
+  "Essential Operations"
+  "Templates and Exceptions"
+  "Containers and Iterators"
+  "Maps and Sets"
+  "Algorithms"
+  "Ideals and History (PPP2)"
+  "Text Manipulation (PPP2)"
+  "Numerics (PPP2)"
+  "Embedded Systems Programming (PPP2)"
+  "Testing (PPP2)"
+  "The C Programming Language (PPP2)"
+)
+PPP3_LAST=21
+
+# --------------------------------------------------------------- helpers ----
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+info()  { printf '\033[36m›\033[0m %s\n' "$*"; }
+warn()  { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()   { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+today() { date +%Y-%m-%d; }
+
+# "3", "03", "ch3", "ch03" -> "ch03"
+chdir_of() {
+  local n="${1#ch}"
+  case "$n" in ''|*[!0-9]*) die "not a chapter: $1 (try 3 or ch03)";; esac
+  printf 'ch%02d' "$((10#$n))"
+}
+chnum_of() { local d="${1#ch}"; echo "$((10#$d))"; }
+title_of() { local n; n="$(chnum_of "$1")"; [ "$n" -lt "${#TITLES[@]}" ] && echo "${TITLES[$n]}" || echo "—"; }
+
+count_files() {   # count_files <dir> <glob> [<glob>...]
+  local dir="$1"; shift
+  [ -d "$dir" ] || { echo 0; return; }
+  local expr=() g
+  for g in "$@"; do [ ${#expr[@]} -gt 0 ] && expr+=(-o); expr+=(-name "$g"); done
+  find "$dir" -type f \( "${expr[@]}" \) 2>/dev/null | wc -l | tr -d ' '
+}
+
+in_git()      { git rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+has_commits() { git rev-parse --verify HEAD >/dev/null 2>&1; }
+
+keep_empty_dirs() {
+  find chapters projects -type d -empty -exec touch {}/.gitkeep \; 2>/dev/null || true
+}
+
+# Refuse to commit the book or anything huge (GitHub rejects files > 100 MB).
+guard_staged() {
+  local bad
+  bad="$(git diff --cached --name-only --diff-filter=AM | grep -Ei '\.(pdf|epub|mobi)$|^books/' || true)"
+  [ -z "$bad" ] || die "refusing to commit book files (copyrighted — keep them local):
+$bad
+Unstage with: git restore --staged <file>"
+  local f size
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    size=$(wc -c < "$f" | tr -d ' ')
+    [ "$size" -lt 52428800 ] || die "$f is $((size/1048576)) MB — too big for GitHub. Add it to .gitignore."
+  done < <(git diff --cached --name-only --diff-filter=AM)
+}
+
+# ---------------------------------------------------------------- readme ----
+progress_bar() {  # progress_bar <done> <total> <width>
+  local d=$1 t=$2 w=$3 filled=0 i out=""
+  [ "$t" -gt 0 ] && filled=$(( d * w / t ))
+  for ((i=0; i<w; i++)); do [ $i -lt $filled ] && out+="█" || out+="░"; done
+  echo "$out"
+}
+
+generate_section() {
+  local done_ppp3=0 total_ppp3=0 dir ch n title d e nt status
+  local rows=""
+  for dir in chapters/ch[0-9][0-9]; do
+    [ -d "$dir" ] || continue
+    ch="$(basename "$dir")"; n="$(chnum_of "$ch")"; title="$(title_of "$ch")"
+    d=$(count_files "$dir/drills" '*.cpp' '*.cppm')
+    e=$(count_files "$dir/exercises" '*.cpp' '*.cppm')
+    nt=$(count_files "$dir/notes" '*.md')
+    if   [ -f "$dir/.done" ]; then status="✅"
+    elif [ $((d + e + nt)) -gt 0 ]; then status="🚧"
+    else status="⬜"; fi
+    if [ "$n" -le "$PPP3_LAST" ]; then
+      total_ppp3=$((total_ppp3 + 1))
+      [ "$status" = "✅" ] && done_ppp3=$((done_ppp3 + 1))
+    fi
+    rows+="| [${n}](chapters/${ch}) | ${title} | ${d} | ${e} | ${nt} | ${status} |"$'\n'
+  done
+
+  local cpp_files loc projects=""
+  cpp_files=$(count_files chapters '*.cpp' '*.cppm' '*.h' '*.hpp')
+  loc=$(find chapters projects -type f \( -name '*.cpp' -o -name '*.cppm' -o -name '*.h' -o -name '*.hpp' \) -exec cat {} + 2>/dev/null | wc -l | tr -d ' ')
+  for dir in projects/*/; do
+    [ -d "$dir" ] || continue
+    local p; p="$(basename "$dir")"
+    local desc=""
+    [ -f "$dir/README.md" ] && desc=" — $(grep -m1 -v '^#\|^[[:space:]]*$' "$dir/README.md" || true)"
+    projects+="- [${p}](projects/${p})${desc}"$'\n'
+  done
+  [ -n "$projects" ] || projects="_None yet — coming once the foundations are solid._"$'\n'
+
+  local pct=0
+  [ "$total_ppp3" -gt 0 ] && pct=$(( done_ppp3 * 100 / total_ppp3 ))
+
+  cat <<EOF
+## Progress
+
+\`$(progress_bar "$done_ppp3" "$total_ppp3" 30)\` **${done_ppp3}/${total_ppp3}** PPP3 chapters done (${pct}%)
+
+| Ch | Title | Drills | Exercises | Notes | Status |
+|---:|-------|:------:|:---------:|:-----:|:------:|
+${rows}
+✅ done · 🚧 in progress · ⬜ not started — chapters 22–27 are 2nd-edition chapters the 3rd edition dropped.
+
+**${cpp_files}** C++ files · **${loc}** lines of C++ · last updated $(today)
+
+## Projects
+
+${projects}
+EOF
+
+  if in_git && has_commits; then
+    echo "## Recent activity"
+    echo
+    git log -5 --date=short --format='- `%h` %ad — %s' 2>/dev/null || true
+    echo
+  fi
+}
+
+write_readme_skeleton() {
+  cat > README.md <<'EOF'
+# PPP C++ 📘
+
+Working through **[Programming: Principles and Practice Using C++, 3rd Edition](https://www.stroustrup.com/PPP3.html)**
+by Bjarne Stroustrup — learning modern C++ (C++20/23) properly, one chapter at a time,
+then building some projects with it.
+
+## Layout
+
+```
+chapters/chNN/
+├── drills/      # the end-of-chapter drills
+├── exercises/   # the end-of-chapter exercises
+└── notes/       # my chapter notes (markdown)
+projects/        # bigger things built after/alongside the book
+JOURNAL.md       # short dated log of what I learned
+ppp              # helper script (see below)
+```
+
+## Building
+
+Code uses `import std;` (C++23 standard library module) with Clang + libc++.
+
+```sh
+./ppp std                                 # once: build the std module into build/
+./ppp run chapters/ch02/exercises/ex01.cpp
+```
+
+Compiled with `-std=c++23 -Wall -Wextra -Wpedantic -Wconversion -Wshadow`.
+
+## Workflow
+
+```sh
+./ppp new 3 ex            # chapters/ch03/exercises/ex01.cpp from a template
+./ppp run chapters/ch03/exercises/ex01.cpp
+./ppp journal "narrowing: {} init catches it, = doesn't"
+./ppp done 3              # mark chapter 3 finished
+./ppp save                # refresh README, commit, push
+```
+
+<!-- PPP:START — everything between these markers is generated by `./ppp readme` -->
+<!-- PPP:END -->
+
+---
+
+Solutions and notes are my own. The book itself is © Pearson / Addison-Wesley and is not
+included in this repo — get it from [the author's page](https://www.stroustrup.com/PPP3.html).
+EOF
+}
+
+cmd_readme() {
+  [ -f README.md ] || write_readme_skeleton
+  grep -q '<!-- PPP:START' README.md || {
+    warn "README.md has no <!-- PPP:START --> / <!-- PPP:END --> markers; appending them."
+    printf '\n<!-- PPP:START -->\n<!-- PPP:END -->\n' >> README.md
+  }
+  local gen; gen="$(mktemp)"
+  generate_section > "$gen"
+  awk -v gen="$gen" '
+    /<!-- PPP:START/ { print; print ""; while ((getline l < gen) > 0) print l; skip = 1; next }
+    /<!-- PPP:END/   { skip = 0 }
+    !skip            { print }
+  ' README.md > README.md.tmp && mv README.md.tmp README.md
+  rm -f "$gen"
+  info "README.md updated"
+}
+
+# ------------------------------------------------------------------- new ----
+cmd_new() {
+  [ $# -ge 2 ] || die "usage: ppp new <chapter> <drill|ex|notes> [number] [name]"
+  local ch kind sub prefix num name dir file
+  ch="$(chdir_of "$1")"; kind="$2"; num="${3:-}"; name="${4:-}"
+  case "$kind" in
+    d|drill|drills)          sub=drills;    prefix=drill ;;
+    e|ex|exercise|exercises) sub=exercises; prefix=ex ;;
+    n|note|notes)            sub=notes;     prefix="" ;;
+    *) die "kind must be drill, ex or notes" ;;
+  esac
+  dir="chapters/$ch/$sub"; mkdir -p "$dir"; rm -f "$dir/.gitkeep"
+  local n_ch title; n_ch="$(chnum_of "$ch")"; title="$(title_of "$ch")"
+
+  if [ "$sub" = notes ]; then
+    file="$dir/${ch}.md"
+    [ -e "$file" ] && { info "already exists: $file"; return; }
+    cat > "$file" <<EOF
+# Chapter ${n_ch} — ${title}
+
+_Started $(today)_
+
+## Key ideas
+
+-
+
+## New C++ I met
+
+\`\`\`cpp
+\`\`\`
+
+## Gotchas / things that surprised me
+
+-
+
+## Review questions
+
+1.
+
+## Terms
+
+-
+EOF
+    info "created $file"; return
+  fi
+
+  # A non-numeric 3rd arg is the name: `ppp new 3 ex vowels`
+  case "$num" in *[!0-9]*) name="$num"; num="";; esac
+  if [ -z "$num" ]; then
+    local last
+    last=$(ls "$dir" 2>/dev/null | sed -n "s/^${prefix}\([0-9][0-9]*\).*/\1/p" | sort -n | tail -1)
+    num=$(( ${last:-0} + 1 ))
+  fi
+  file="$dir/$(printf '%s%02d' "$prefix" "$((10#$num))")${name:+_$name}.cpp"
+  [ -e "$file" ] && die "already exists: $file"
+  local label; [ "$sub" = drills ] && label="Drill" || label="Exercise"
+  cat > "$file" <<EOF
+// PPP3 — Chapter ${n_ch}: ${title}
+// ${label} $((10#$num))${name:+ ($name)}
+//
+// Task:
+//
+// Date: $(today)
+
+import std;
+
+int main()
+{
+
+}
+EOF
+  info "created $file"
+  printf '%s\n' "$file"
+}
+
+# ------------------------------------------------------------------- std ----
+find_std_cppm() {
+  local c rd
+  if have brew; then c="$(brew --prefix llvm 2>/dev/null)/share/libc++/v1/std.cppm"; [ -f "$c" ] && { echo "$c"; return; }; fi
+  rd="$("$CXX" -print-resource-dir 2>/dev/null || true)"
+  if [ -n "$rd" ]; then c="$rd/../../../share/libc++/v1/std.cppm"; [ -f "$c" ] && { echo "$c"; return; }; fi
+  for c in /opt/homebrew/opt/llvm/share/libc++/v1/std.cppm /usr/local/opt/llvm/share/libc++/v1/std.cppm \
+           /usr/lib/llvm-*/share/libc++/v1/std.cppm /usr/local/share/libc++/v1/std.cppm /usr/share/libc++/v1/std.cppm; do
+    [ -f "$c" ] && { echo "$c"; return; }
+  done
+  return 1
+}
+
+cmd_std() {
+  have "$CXX" || die "$CXX not found (set CXX in .ppprc)"
+  local cppm="${STD_CPPM:-}"
+  [ -n "$cppm" ] || cppm="$(find_std_cppm)" || die "couldn't find libc++'s std.cppm — set STD_CPPM in .ppprc"
+  mkdir -p build
+  info "precompiling std module from $cppm"
+  # shellcheck disable=SC2086
+  "$CXX" $STD_FLAGS -Wno-reserved-module-identifier --precompile "$cppm" -o "$STD_PCM"
+  build_std_obj
+}
+
+build_std_obj() {
+  info "compiling $STD_OBJ"
+  # shellcheck disable=SC2086
+  "$CXX" $STD_FLAGS -c "$STD_PCM" -o "$STD_OBJ"
+}
+
+# ------------------------------------------------------------------- run ----
+cmd_run() {
+  [ $# -ge 1 ] || die "usage: ppp run <file.cpp|dir> [-- program args]"
+  local target="$1"; shift
+  [ "${1:-}" = "--" ] && shift
+  local srcs=() out rel
+  if [ -d "$target" ]; then
+    while IFS= read -r f; do srcs+=("$f"); done < <(find "$target" -maxdepth 1 -name '*.cpp' | sort)
+    [ ${#srcs[@]} -gt 0 ] || die "no .cpp files in $target"
+    rel="${target%/}"
+  else
+    [ -f "$target" ] || die "no such file: $target"
+    srcs=("$target"); rel="${target%.*}"
+  fi
+  rel="${rel#./}"; rel="${rel#chapters/}"
+  mkdir -p build/bin
+  out="build/bin/$(echo "$rel" | tr '/' '_')"
+
+  local mod=()
+  if grep -Eq '^[[:space:]]*import[[:space:]]+std(\.compat)?[[:space:]]*;' "${srcs[@]}"; then
+    [ -f "$STD_PCM" ] || die "$STD_PCM missing — run ./ppp std first"
+    [ -f "$STD_OBJ" ] && [ "$STD_OBJ" -nt "$STD_PCM" ] || build_std_obj
+    mod=(-fmodule-file=std="$STD_PCM")
+    # shellcheck disable=SC2086
+    "$CXX" $STD_FLAGS $WARN_FLAGS "${mod[@]}" "${srcs[@]}" "$STD_OBJ" -o "$out" $EXTRA_LDFLAGS
+  else
+    # shellcheck disable=SC2086
+    "$CXX" $STD_FLAGS $WARN_FLAGS "${srcs[@]}" -o "$out" $EXTRA_LDFLAGS
+  fi
+  printf '\033[2m── %s ──\033[0m\n' "$out"
+  "./$out" "$@"
+}
+
+# ------------------------------------------------------------------ save ----
+cmd_save() {
+  in_git || die "not a git repo — run ./ppp setup first"
+  keep_empty_dirs
+  cmd_readme >/dev/null
+  git add -A
+  if git diff --cached --quiet; then info "nothing new to save"; return; fi
+  guard_staged
+  local msg="${1:-}"
+  if [ -z "$msg" ]; then
+    local chs nfiles
+    chs=$(git diff --cached --name-only | sed -n 's|^chapters/\(ch[0-9][0-9]\)/.*|\1|p' | sort -u | tr '\n' ' ' | sed 's/ $//')
+    nfiles=$(git diff --cached --name-only | grep -cv '^README.md$' || true)
+    if [ -n "$chs" ]; then msg="Progress on ${chs// /, } (${nfiles} file$([ "$nfiles" = 1 ] || echo s))"
+    else msg="Update ($nfiles file$([ "$nfiles" = 1 ] || echo s))"; fi
+  fi
+  git commit -q -m "$msg"
+  info "committed: $msg"
+  if git remote get-url origin >/dev/null 2>&1; then
+    if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then git push -q
+    else git push -q -u origin "$(git branch --show-current)"; fi \
+      && info "pushed to $(git remote get-url origin)" \
+      || warn "push failed (offline?) — commit is saved locally; run ./ppp save again later"
+  else
+    warn "no 'origin' remote yet — run ./ppp setup to create the GitHub repo"
+  fi
+}
+
+# ----------------------------------------------------------------- setup ----
+cmd_setup() {
+  local name="" vis="--public"
+  for a in "$@"; do
+    case "$a" in --private) vis="--private";; --public) vis="--public";; *) name="$a";; esac
+  done
+  [ -n "$name" ] || name="$(basename "$ROOT")"
+
+  bold "Setting up $name"
+  in_git || { git init -q; info "git init"; }
+
+  # The book must never reach GitHub. If it's already in history, stop.
+  if has_commits && [ -n "$(git log --all --oneline -- books '*.pdf' '*.epub' 2>/dev/null | head -1)" ]; then
+    die "the book (books/, *.pdf or *.epub) is already in your git history.
+Pushing would upload it. Remove it from history first, e.g.:
+  pip install git-filter-repo
+  git filter-repo --invert-paths --path books/ --path-glob '*.pdf' --path-glob '*.epub'
+then run ./ppp setup again."
+  fi
+
+  [ -f .gitignore ] || die ".gitignore missing — copy it from the toolkit first"
+  keep_empty_dirs
+
+  # Stop tracking anything that's now ignored (old binaries, build/, etc.).
+  local tracked_ignored
+  tracked_ignored="$(git ls-files -ci --exclude-standard)"
+  if [ -n "$tracked_ignored" ]; then
+    info "untracking files that are now ignored (they stay on disk):"
+    printf '    %s\n' $tracked_ignored
+    git ls-files -ci --exclude-standard -z | xargs -0 git rm -q --cached
+  fi
+
+  [ -f JOURNAL.md ] || printf '# Learning journal\n\nShort, dated notes on what clicked (or didn'"'"'t).\n' > JOURNAL.md
+  cmd_readme
+  git add -A
+  guard_staged
+  git diff --cached --quiet || git commit -q -m "Set up repo: README, .gitignore, ppp helper"
+  git branch -M main
+
+  if git remote get-url origin >/dev/null 2>&1; then
+    info "origin already set: $(git remote get-url origin)"
+    git push -u origin main
+  elif have gh && gh auth status >/dev/null 2>&1; then
+    gh repo create "$name" "$vis" --source=. --remote=origin --push --description "$REPO_DESCRIPTION"
+    gh repo edit --add-topic cpp,cpp23,modern-cpp,stroustrup,learning,programming-principles-and-practice >/dev/null 2>&1 || true
+    info "done → $(gh repo view --json url -q .url)"
+  else
+    warn "GitHub CLI (gh) not installed or not logged in."
+    cat <<EOF
+Either:
+  sudo apt install gh   (Debian/Ubuntu; or see https://cli.github.com)
+  gh auth login  &&  ./ppp setup
+Or by hand:
+  1. Create an EMPTY repo named '$name' at https://github.com/new (no README/.gitignore)
+  2. git remote add origin git@github.com:<your-username>/$name.git
+  3. git push -u origin main
+EOF
+  fi
+}
+
+# ------------------------------------------------------------- the rest ----
+cmd_done() {
+  [ $# -ge 1 ] || die "usage: ppp done <chapter>"
+  local ch; ch="$(chdir_of "$1")"
+  [ -d "chapters/$ch" ] || die "chapters/$ch doesn't exist"
+  if [ -f "chapters/$ch/.done" ]; then rm "chapters/$ch/.done"; info "$ch marked not done"
+  else today > "chapters/$ch/.done"; info "$ch marked done 🎉 ($(title_of "$ch"))"; fi
+  cmd_readme >/dev/null
+}
+
+cmd_journal() {
+  [ $# -ge 1 ] || die "usage: ppp journal \"what I learned\""
+  [ -f JOURNAL.md ] || printf '# Learning journal\n\nShort, dated notes on what clicked (or didn'"'"'t).\n' > JOURNAL.md
+  local d; d="$(today)"
+  grep -q "^## $d\$" JOURNAL.md || printf '\n## %s\n\n' "$d" >> JOURNAL.md
+  printf -- '- %s\n' "$*" >> JOURNAL.md
+  info "noted in JOURNAL.md"
+}
+
+cmd_fmt() {
+  have clang-format || die "clang-format not found"
+  if [ $# -gt 0 ]; then clang-format -i "$@"
+  else find chapters projects -type f \( -name '*.cpp' -o -name '*.cppm' -o -name '*.h' -o -name '*.hpp' \) -exec clang-format -i {} +; fi
+  info "formatted"
+}
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  setup)   cmd_setup "$@" ;;
+  new)     cmd_new "$@" ;;
+  run)     cmd_run "$@" ;;
+  save)    cmd_save "$@" ;;
+  done)    cmd_done "$@" ;;
+  journal) cmd_journal "$@" ;;
+  readme)  cmd_readme ;;
+  std)     cmd_std ;;
+  fmt)     cmd_fmt "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

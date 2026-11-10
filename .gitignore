@@ -1,0 +1,6 @@
+# NEVER in git: books, object files, executable files
+books/
+*.pdf
+*.o
+*.pub
+
