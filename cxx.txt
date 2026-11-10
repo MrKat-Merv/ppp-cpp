@@ -1,1 +1,0 @@
-cxx is aliased to `clang++ -std=c++23 -stdlib=libc++ -Wall -Wextra -fmodule-file=std=$HOME/ppp-cpp/build/std.pcm $HOME/ppp-cpp/build/std.pcm'
