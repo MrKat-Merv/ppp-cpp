@@ -1,6 +1,45 @@
+cd ~/ppp-cpp
+cat > .gitignore <<'EOF'
 # NEVER in git: books, object files, executable files
-books/
+/books/
 *.pdf
+*.epub
+*.mobi
+
+# Build output (std.pcm is machine-specific; ./ppp std rebuilds it)
+/build/
+*.pcm
 *.o
-*.pub
+*.obj
+a.out
+*.out
+*.exe
+
+# Chapters: only allow source + notes, so compiled programs never get in
+/chapters/**
+!/chapters/**/
+!/chapters/**/*.cpp
+!/chapters/**/*.cppm
+!/chapters/**/*.h
+!/chapters/**/*.hpp
+!/chapters/**/*.md
+!/chapters/**/*.txt
+!/chapters/**/*.csv
+!/chapters/**/.gitkeep
+!/chapters/**/.done
+
+# Projects
+/projects/**/build/
+/projects/**/cmake-build-*/
+/projects/**/.cache/
+compile_commands.json
+
+# Local / editor / OS
+.ppprc
+.DS_Store
+.vscode/
+.idea/
+*.swp
+ppp_cpp.txt
+EOF
 
