@@ -1,5 +1,3 @@
-cd ~/ppp-cpp
-cat > .gitignore <<'EOF'
 # NEVER in git: books, object files, executable files
 /books/
 *.pdf
@@ -41,5 +39,3 @@ compile_commands.json
 .idea/
 *.swp
 ppp_cpp.txt
-EOF
-
